@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import sys
 from typing import TextIO
+from uuid import uuid4
 
-from .model import RunRecord, ValidationError
+from pydantic import ValidationError as SchemaValidationError
+
+from .model import ValidationError
 from .run_api import InMemoryRunStore, RunAPI
 from .runtime import FixedExecutor
+from .schemas import CreateRunRequest, RunResponse, RunStatus
 
 BANNER = "RunAPI CLI（内存模式）。输入 /help 查看命令。"
 PROMPT = "codeagent> "
@@ -23,18 +27,22 @@ def _write(stream: TextIO, text: str) -> None:
     stream.flush()
 
 
-def _render_record(record: RunRecord, stdout: TextIO, *, created: bool) -> None:
+def _render_record(record: RunResponse, stdout: TextIO, *, created: bool) -> None:
     heading = "已创建运行" if created else "运行"
     _write(stdout, f"{heading}：{record.run_id}\n")
-    if record.status == "succeeded":
+    if record.status == RunStatus.SUCCEEDED:
+        output = record.output or {}
         _write(stdout, "状态：执行成功\n")
-        _write(stdout, f"结果：{record.result}\n")
+        _write(stdout, f"结果：{output.get('text')}\n")
     else:
+        error = record.error or {}
         _write(stdout, "状态：执行失败\n")
-        _write(stdout, f"原因：{record.error}\n")
+        _write(stdout, f"原因：{error.get('message')}\n")
 
 
-def run_repl(api: RunAPI, stdin: TextIO, stdout: TextIO) -> int:
+def run_repl(api: RunAPI | None, stdin: TextIO, stdout: TextIO) -> int:
+    if api is None:
+        api = RunAPI(InMemoryRunStore(), FixedExecutor())
     _write(stdout, f"{BANNER}\n")
 
     while True:
@@ -59,12 +67,16 @@ def run_repl(api: RunAPI, stdin: TextIO, stdout: TextIO) -> int:
 
         if command == "/run":
             try:
-                record = api.submit_run(payload)
-            except ValidationError as exc:
-                _write(
-                    stdout,
-                    f"提交失败：{exc.field} {exc.reason}（未创建运行记录）\n",
+                request = CreateRunRequest(
+                    run_type="text",
+                    idempotency_key=uuid4().hex,
+                    input={"query": payload},
                 )
+                record = api.create_run(request)
+            except ValidationError as exc:
+                _write(stdout, f"提交失败：{exc.field} {exc.reason}（未创建运行记录）\n")
+            except SchemaValidationError:
+                _write(stdout, "提交失败：请求格式无效（未创建运行记录）\n")
             else:
                 _render_record(record, stdout, created=True)
         elif command == "/get":
@@ -72,7 +84,7 @@ def run_repl(api: RunAPI, stdin: TextIO, stdout: TextIO) -> int:
             if not run_id:
                 _write(stdout, "用法：/get <run_id>\n")
                 continue
-            record = api.get_run(run_id)
+            record = api.query_run(run_id)
             if record is None:
                 _write(stdout, f"找不到这次运行：{run_id}\n")
             else:
@@ -99,9 +111,8 @@ def _configure_utf8_stdio() -> None:
 
 def main() -> int:
     _configure_utf8_stdio()
-    api = RunAPI(InMemoryRunStore(), FixedExecutor())
     try:
-        return run_repl(api, sys.stdin, sys.stdout)
+        return run_repl(None, sys.stdin, sys.stdout)
     except KeyboardInterrupt:
         _write(sys.stdout, "\n")
         return 130

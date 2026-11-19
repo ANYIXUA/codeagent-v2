@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from datetime import datetime
+from typing import Any
+
+from .schemas import RunStatus
 
 MAX_REQUEST_CHARS = 2000
-
-RunStatus = Literal["succeeded", "failed"]
 
 
 @dataclass(frozen=True)
@@ -15,6 +16,11 @@ class RunRecord:
     status: RunStatus
     result: str | None
     error: str | None
+    run_type: str
+    input: dict[str, Any]
+    created_at: datetime
+    started_at: datetime
+    ended_at: datetime
 
 
 class ValidationError(Exception):

@@ -2,25 +2,25 @@
 
 第一章实现一个在终端中运行的 RunAPI：用户在同一个交互式 CLI 会话里提交请求，并用返回的 `run_id` 查询结果。
 
-本章运行记录只保存在 CLI 进程内存中，退出 CLI 后失效；执行由固定执行器同步完成，不连接数据库、队列或真实模型。
+CLI 直接调用进程内的 RunAPI，由固定执行器同步完成。运行记录保存在当前会话的内存中，退出后失效。
 
 ## 环境
 
 - Python 3.12
 - Windows + PowerShell
-- 无第三方运行依赖，测试使用 Python 标准库 `unittest`
-- 本次验收使用 conda 环境 `dev`（Python 3.13.15）；同一套测试也在 CPython 3.12.14 下通过
+- 运行依赖是 Pydantic，测试运行器为 `unittest`
 
 ## 启动
 
 在仓库根目录执行：
 
 ```powershell
+python -m pip install -r requirements.txt
 $env:PYTHONUTF8 = '1'
 python -m codeagent_v2
 ```
 
-入口文件为 `codeagent_v2/__main__.py`。不要使用 `python -m codeagent`（包名错误）或 `python codeagent_v2/__main__.py`（会绕过包上下文）。
+CLI 入口是 `codeagent_v2/__main__.py`。每个 CLI 会话创建一次 RunAPI 和内存存储。
 
 ## CLI 命令
 
@@ -58,6 +58,5 @@ python -m unittest discover -s tests -v
 
 ## 本章限制
 
-- 运行记录只在当前 CLI 进程内存中，退出即丢失。
-- 固定执行器同步执行，不调用真实模型或工具。
-- 不包含排队、Worker、幂等、取消、恢复、事件流和持久化；这些留给后续章节。
+- 当前通过固定执行器同步完成成功和失败路径。
+- CLI 自动生成 `idempotency_key`，本章只校验该字段。取消和恢复的请求模型已定义，行为留在对应章节。

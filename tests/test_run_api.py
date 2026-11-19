@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import os
 import re
+import signal
 import subprocess
 import sys
 import unittest
@@ -152,7 +153,7 @@ class RunAPITests(unittest.TestCase):
 
         self.assertEqual(record.run_id, DEFAULT_RUN_ID)
         self.assertEqual(record.status, "failed")
-        self.assertEqual(record.error, "执行器异常：RuntimeError: boom")
+        self.assertEqual(record.error, "执行器异常")
         self.assertEqual(store.count(), 1)
 
     def test_invalid_submission_creates_no_record(self) -> None:
@@ -308,6 +309,19 @@ class CLITests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(stdout.getvalue().startswith(BANNER))
         self.assertTrue(stdout.getvalue().endswith("\n"))
+
+    def test_cli_interrupt_while_reading_returns_130(self) -> None:
+        class InterruptingInput(io.StringIO):
+            def readline(self, size: int = -1) -> str:
+                signal.raise_signal(signal.SIGINT)
+                return ""
+
+        api, _ = make_api()
+        try:
+            code = run_repl(api, InterruptingInput(), io.StringIO())
+        except KeyboardInterrupt:
+            self.fail("The REPL must handle SIGINT during input and return 130")
+        self.assertEqual(code, 130)
 
     def test_cli_session_restart_loses_records(self) -> None:
         first_api, _ = make_api([DEFAULT_RUN_ID])

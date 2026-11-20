@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from threading import Barrier
 
 import pytest
-from sqlalchemy import func, insert, select, text
+from sqlalchemy import event, func, insert, select, text
 
 from codeagent_v2.cli import run_repl
 from codeagent_v2.db_schema import (
@@ -223,9 +223,10 @@ def test_null_character_is_rejected_before_execution_and_literal_is_saved(pg_sto
         executor=CountingExecutor(),
     )
     invalid = create_request("空字符", "pg-null-key-0001")
-    invalid.input["metadata"] = {"nested": ["ok", "bad\x00value"]}
-    with pytest.raises(ValidationError):
-        api.create_run(invalid)
+    for nested in (["ok", "bad\x00value"], ("ok", "bad\x00value")):
+        invalid.input["metadata"] = {"nested": nested}
+        with pytest.raises(ValidationError):
+            api.create_run(invalid)
     assert calls == 0
     assert count_rows(pg_store.engine, agent_runs) == 0
 
@@ -743,6 +744,35 @@ def test_cli_read_failure_reports_query_failure_and_continues(
     output = stdout.getvalue()
     engine.dispose()
 
+    assert code == 0
+    assert output.count("查询失败：") == 3
+    assert "/trace <run_id>" in output
+    assert "再见。" in output
+
+
+def test_cli_read_disconnect_during_rollback_reports_failure_and_continues(pg_store) -> None:
+    api = make_api(pg_store.store)
+    response = api.create_run(create_request("读取断连", "pg-read-disconnect"))
+    commands = io.StringIO(
+        f"/get {response.run_id}\n"
+        f"/events {response.run_id}\n"
+        f"/trace {response.run_id}\n"
+        "/help\n"
+        "/exit\n"
+    )
+    stdout = io.StringIO()
+    with pg_store.engine.connect() as control:
+        def disconnect(connection) -> None:
+            backend_pid = connection.connection.driver_connection.info.backend_pid
+            assert control.scalar(select(func.pg_terminate_backend(backend_pid, 5000)))
+
+        event.listen(pg_store.engine, "rollback", disconnect)
+        try:
+            code = run_repl(api, commands, stdout)
+        finally:
+            event.remove(pg_store.engine, "rollback", disconnect)
+
+    output = stdout.getvalue()
     assert code == 0
     assert output.count("查询失败：") == 3
     assert "/trace <run_id>" in output

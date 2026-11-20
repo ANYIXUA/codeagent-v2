@@ -14,7 +14,7 @@ MAX_INPUT_NESTING = 64
 def _check_json_depth(value: object, depth: int = 0) -> None:
     if isinstance(value, dict):
         children = value.values()
-    elif isinstance(value, list):
+    elif isinstance(value, (list, tuple)):
         children = value
     else:
         return
@@ -37,7 +37,7 @@ def find_null_character(value: object, path: str = "input") -> str | None:
             found = find_null_character(child, child_path)
             if found is not None:
                 return found
-    elif isinstance(value, list):
+    elif isinstance(value, (list, tuple)):
         for index, child in enumerate(value):
             found = find_null_character(child, f"{path}[{index}]")
             if found is not None:

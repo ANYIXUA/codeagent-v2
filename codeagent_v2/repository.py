@@ -160,9 +160,16 @@ class PostgresRunStore:
             )
         )
 
-    def get(self, run_id: str) -> RunRecord | None:
-        session = self._session_factory()
+    @contextmanager
+    def _read_session(self, error_message: str) -> Iterator[Session]:
         try:
+            with self._session_factory() as session:
+                yield session
+        except SQLAlchemyError as exc:
+            raise _store_error(error_message, exc) from None
+
+    def get(self, run_id: str) -> RunRecord | None:
+        with self._read_session("查询运行记录失败") as session:
             row = (
                 session.execute(
                     sa.select(agent_runs)
@@ -173,14 +180,9 @@ class PostgresRunStore:
                 .one_or_none()
             )
             return self._record_from_row(row) if row is not None else None
-        except SQLAlchemyError as exc:
-            raise _store_error("查询运行记录失败", exc) from None
-        finally:
-            session.close()
 
     def list_events(self, run_id: str) -> list[RunEvent] | None:
-        session = self._session_factory()
-        try:
+        with self._read_session("查询运行事件失败") as session:
             if not self._run_exists(session, run_id):
                 return None
             rows = (
@@ -193,10 +195,6 @@ class PostgresRunStore:
                 .all()
             )
             return [self._event_from_row(row) for row in rows]
-        except SQLAlchemyError as exc:
-            raise _store_error("查询运行事件失败", exc) from None
-        finally:
-            session.close()
 
     def append_event(
         self,
@@ -204,9 +202,8 @@ class PostgresRunStore:
         event_type: str,
         payload: dict[str, Any],
     ) -> RunEvent | None:
-        session = self._session_factory()
         try:
-            with session.begin():
+            with self._session_factory.begin() as session:
                 locked = session.execute(
                     sa.select(agent_runs.c.id)
                     .where(agent_runs.c.org_id == self.org_id)
@@ -245,12 +242,9 @@ class PostgresRunStore:
             return event
         except SQLAlchemyError as exc:
             raise _store_error("保存运行事件失败", exc) from None
-        finally:
-            session.close()
 
     def get_trace(self, run_id: str) -> RunTrace | None:
-        session = self._session_factory()
-        try:
+        with self._read_session("查询执行轨迹失败") as session:
             row = (
                 session.execute(
                     sa.select(agent_runs)
@@ -305,10 +299,6 @@ class PostgresRunStore:
                 tool_calls=tools,
                 checkpoints=saved_checkpoints,
             )
-        except SQLAlchemyError as exc:
-            raise _store_error("查询执行轨迹失败", exc) from None
-        finally:
-            session.close()
 
     @staticmethod
     def _rows(session: Session, statement: Any) -> list[dict[str, Any]]:

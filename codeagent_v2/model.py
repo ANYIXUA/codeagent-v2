@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -19,8 +19,28 @@ class RunRecord:
     run_type: str
     input: dict[str, Any]
     created_at: datetime
-    started_at: datetime
-    ended_at: datetime
+    started_at: datetime | None
+    ended_at: datetime | None
+
+
+@dataclass(frozen=True)
+class RunEvent:
+    event_id: str
+    run_id: str
+    sequence: int
+    event_type: str
+    payload: dict[str, Any]
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class RunTrace:
+    run: RunRecord
+    steps: list[dict[str, Any]] = field(default_factory=list)
+    events: list[RunEvent] = field(default_factory=list)
+    model_calls: list[dict[str, Any]] = field(default_factory=list)
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    checkpoints: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ValidationError(Exception):
@@ -28,6 +48,14 @@ class ValidationError(Exception):
         super().__init__(f"{field} {reason}")
         self.field = field
         self.reason = reason
+
+
+class RunStoreError(Exception):
+    """A database read or write could not be confirmed."""
+
+
+class DuplicateIdempotencyKeyError(RunStoreError):
+    """The same organization already used this idempotency key."""
 
 
 def validate_request(request: object) -> str:

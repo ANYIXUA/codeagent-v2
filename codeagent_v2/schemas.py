@@ -25,6 +25,39 @@ def _check_json_depth(value: object, depth: int = 0) -> None:
         _check_json_depth(child, depth + 1)
 
 
+def find_null_character(value: object, path: str = "input") -> str | None:
+    """Return the first path containing an actual U+0000 character."""
+
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key_text = key if isinstance(key, str) else str(key)
+            child_path = f"{path}.{key_text}"
+            if "\x00" in key_text:
+                return child_path
+            found = find_null_character(child, child_path)
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found = find_null_character(child, f"{path}[{index}]")
+            if found is not None:
+                return found
+    elif isinstance(value, str) and "\x00" in value:
+        return path
+    return None
+
+
+def validate_json_value(value: object) -> None:
+    _check_json_depth(value)
+    null_path = find_null_character(value)
+    if null_path is not None:
+        raise ValueError("Input must not contain the actual U+0000 character.")
+    try:
+        json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Input must contain valid UTF-8 JSON values and finite numbers.") from exc
+
+
 class RunStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
@@ -42,11 +75,7 @@ class CreateRunRequest(BaseModel):
     @field_validator("input")
     @classmethod
     def validate_input_json(cls, value: dict[str, Any]) -> dict[str, Any]:
-        _check_json_depth(value)
-        try:
-            json.dumps(value, ensure_ascii=False, allow_nan=False).encode("utf-8")
-        except (TypeError, ValueError) as exc:
-            raise ValueError("Input must contain valid UTF-8 JSON values and finite numbers.") from exc
+        validate_json_value(value)
         return value
 
 

@@ -4,19 +4,40 @@ import logging
 import secrets
 from collections.abc import Callable
 from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
-from .model import RunRecord, validate_request
+from .model import (
+    DuplicateIdempotencyKeyError,
+    RunEvent,
+    RunRecord,
+    RunStoreError,
+    RunTrace,
+    ValidationError,
+    validate_request,
+)
 from .runtime import ExecutionOutcome, Executor
-from .schemas import CreateRunRequest, RunResponse, RunStatus
+from .schemas import (
+    CreateRunRequest,
+    RunResponse,
+    RunStatus,
+    find_null_character,
+    validate_json_value,
+)
 
 
 logger = logging.getLogger(__name__)
 
+MAX_ID_ATTEMPTS = 100
+
 
 def default_run_id() -> str:
     return f"run_{secrets.token_hex(6)}"
+
+
+def _default_event_id() -> str:
+    return f"evt_{secrets.token_hex(6)}"
 
 
 def _run_response(record: RunRecord) -> RunResponse:
@@ -33,15 +54,99 @@ def _run_response(record: RunRecord) -> RunResponse:
     )
 
 
+class RunStore(Protocol):
+    def add(self, record: RunRecord, *, idempotency_key: str) -> bool: ...
+
+    def get(self, run_id: str) -> RunRecord | None: ...
+
+    def list_events(self, run_id: str) -> list[RunEvent] | None: ...
+
+    def append_event(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> RunEvent | None: ...
+
+    def get_trace(self, run_id: str) -> RunTrace | None: ...
+
+
 class InMemoryRunStore:
-    def __init__(self) -> None:
+    """Test double that follows the same contract as the PostgreSQL store."""
+
+    def __init__(self, org_id: str = "local-org") -> None:
+        self.org_id = org_id
         self._records: dict[str, RunRecord] = {}
+        self._idempotency: dict[str, str] = {}
+        self._events: dict[str, list[RunEvent]] = {}
 
     def put(self, record: RunRecord) -> None:
         self._records[record.run_id] = record
+        self._events.setdefault(record.run_id, [])
+
+    def add(self, record: RunRecord, *, idempotency_key: str) -> bool:
+        if idempotency_key in self._idempotency:
+            raise DuplicateIdempotencyKeyError(
+                "同一组织已使用该 idempotency_key，已保留原有运行记录"
+            )
+        if record.run_id in self._records:
+            return False
+        self._idempotency[idempotency_key] = record.run_id
+        self._records[record.run_id] = record
+        self._events[record.run_id] = [
+            RunEvent(
+                event_id=_default_event_id(),
+                run_id=record.run_id,
+                sequence=1,
+                event_type="run.created",
+                payload={
+                    "run_id": record.run_id,
+                    "run_type": record.run_type,
+                    "status": record.status.value,
+                    "input": deepcopy(record.input),
+                },
+                created_at=record.created_at,
+            )
+        ]
+        return True
 
     def get(self, run_id: str) -> RunRecord | None:
         return self._records.get(run_id)
+
+    def list_events(self, run_id: str) -> list[RunEvent] | None:
+        if run_id not in self._records:
+            return None
+        return sorted(self._events.get(run_id, []), key=lambda event: event.sequence)
+
+    def append_event(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> RunEvent | None:
+        if run_id not in self._records:
+            return None
+        events = self._events.setdefault(run_id, [])
+        sequence = max((event.sequence for event in events), default=0) + 1
+        event = RunEvent(
+            event_id=_default_event_id(),
+            run_id=run_id,
+            sequence=sequence,
+            event_type=event_type,
+            payload=deepcopy(payload),
+            created_at=datetime.now(UTC),
+        )
+        events.append(event)
+        return event
+
+    def get_trace(self, run_id: str) -> RunTrace | None:
+        record = self._records.get(run_id)
+        if record is None:
+            return None
+        return RunTrace(
+            run=record,
+            events=self.list_events(run_id) or [],
+        )
 
     def count(self) -> int:
         return len(self._records)
@@ -50,7 +155,7 @@ class InMemoryRunStore:
 class RunAPI:
     def __init__(
         self,
-        store: InMemoryRunStore,
+        store: RunStore,
         executor: Executor,
         id_factory: Callable[[], str] | None = None,
     ) -> None:
@@ -59,16 +164,17 @@ class RunAPI:
         self._id_factory = id_factory or default_run_id
 
     def _new_run_id(self) -> str:
-        run_id = self._id_factory()
-        while self._store.get(run_id) is not None:
-            run_id = self._id_factory()
-        return run_id
+        return self._id_factory()
 
     def create_run(self, request: CreateRunRequest) -> RunResponse:
+        null_path = find_null_character(request.input)
+        if null_path is not None:
+            raise ValidationError("input", f"在 {null_path} 包含 U+0000 字符")
         record = self.submit_run(
             request.input.get("query"),
             run_type=request.run_type,
             run_input=request.input,
+            idempotency_key=request.idempotency_key,
         )
         return _run_response(record)
 
@@ -76,17 +182,40 @@ class RunAPI:
         record = self.get_run(run_id)
         return _run_response(record) if record is not None else None
 
+    def list_events(self, run_id: str) -> list[RunEvent] | None:
+        return self._store.list_events(run_id)
+
+    def append_event(
+        self,
+        run_id: str,
+        event_type: str,
+        payload: dict[str, Any],
+    ) -> RunEvent | None:
+        return self._store.append_event(run_id, event_type, payload)
+
+    def get_trace(self, run_id: str) -> RunTrace | None:
+        return self._store.get_trace(run_id)
+
     def submit_run(
         self,
         request: object,
         *,
         run_type: str = "text",
         run_input: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> RunRecord:
         text = validate_request(request)
-        created_at = datetime.now(UTC)
-        run_id = self._new_run_id()
+        input_data = deepcopy(run_input) if run_input is not None else {"query": text}
+        null_path = find_null_character(input_data)
+        if null_path is not None:
+            raise ValidationError("input", f"在 {null_path} 包含 U+0000 字符")
+        try:
+            validate_json_value(input_data)
+        except ValueError as exc:
+            raise ValidationError("input", str(exc)) from exc
 
+        key = idempotency_key or f"key_{secrets.token_hex(12)}"
+        created_at = datetime.now(UTC)
         started_at = datetime.now(UTC)
         try:
             outcome = self._executor.execute(text)
@@ -99,19 +228,23 @@ class RunAPI:
             )
 
         record = RunRecord(
-            run_id=run_id,
+            run_id=self._new_run_id(),
             request=text,
             status=RunStatus.SUCCEEDED if outcome.ok else RunStatus.FAILED,
             result=outcome.result if outcome.ok else None,
             error=outcome.error if not outcome.ok else None,
             run_type=run_type,
-            input=deepcopy(run_input) if run_input is not None else {"query": text},
+            input=input_data,
             created_at=created_at,
             started_at=started_at,
             ended_at=datetime.now(UTC),
         )
-        self._store.put(record)
-        return record
+
+        for _ in range(MAX_ID_ATTEMPTS):
+            if self._store.add(record, idempotency_key=key):
+                return record
+            record = replace(record, run_id=self._new_run_id())
+        raise RunStoreError("无法分配唯一的运行 ID，未保存运行记录")
 
     def get_run(self, run_id: str) -> RunRecord | None:
         return self._store.get(run_id)

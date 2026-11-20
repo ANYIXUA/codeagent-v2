@@ -29,7 +29,7 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    connectable = create_database_engine()
+    connectable = create_database_engine(runtime_timeouts=False)
     try:
         with connectable.connect() as connection:
             context.configure(

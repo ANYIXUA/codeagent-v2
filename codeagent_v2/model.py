@@ -57,6 +57,11 @@ class RunStoreError(Exception):
 class DuplicateIdempotencyKeyError(RunStoreError):
     """The same organization already used this idempotency key."""
 
+    def __init__(
+        self, message: str = "同一组织已使用该 idempotency_key，已保留原有运行记录"
+    ) -> None:
+        super().__init__(message)
+
 
 def validate_request(request: object) -> str:
     if not isinstance(request, str):

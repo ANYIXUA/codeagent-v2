@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import logging
 import secrets
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager
 from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime
+from functools import partial
+from threading import Lock
 from typing import Any, Protocol
 
 from .model import (
@@ -55,7 +58,9 @@ def _run_response(record: RunRecord) -> RunResponse:
 
 
 class RunStore(Protocol):
-    def add(self, record: RunRecord, *, idempotency_key: str) -> bool: ...
+    def submission(
+        self, *, idempotency_key: str
+    ) -> AbstractContextManager[Callable[[RunRecord], RunRecord | None]]: ...
 
     def get(self, run_id: str) -> RunRecord | None: ...
 
@@ -79,18 +84,28 @@ class InMemoryRunStore:
         self._records: dict[str, RunRecord] = {}
         self._idempotency: dict[str, str] = {}
         self._events: dict[str, list[RunEvent]] = {}
+        self._submission_lock = Lock()
 
     def put(self, record: RunRecord) -> None:
         self._records[record.run_id] = record
         self._events.setdefault(record.run_id, [])
 
     def add(self, record: RunRecord, *, idempotency_key: str) -> bool:
-        if idempotency_key in self._idempotency:
-            raise DuplicateIdempotencyKeyError(
-                "同一组织已使用该 idempotency_key，已保留原有运行记录"
-            )
+        with self.submission(idempotency_key=idempotency_key) as save:
+            return save(record) is not None
+
+    @contextmanager
+    def submission(
+        self, *, idempotency_key: str
+    ) -> Iterator[Callable[[RunRecord], RunRecord | None]]:
+        with self._submission_lock:
+            if idempotency_key in self._idempotency:
+                raise DuplicateIdempotencyKeyError()
+            yield partial(self._save_run, idempotency_key=idempotency_key)
+
+    def _save_run(self, record: RunRecord, *, idempotency_key: str) -> RunRecord | None:
         if record.run_id in self._records:
-            return False
+            return None
         self._idempotency[idempotency_key] = record.run_id
         self._records[record.run_id] = record
         self._events[record.run_id] = [
@@ -108,7 +123,7 @@ class InMemoryRunStore:
                 created_at=record.created_at,
             )
         ]
-        return True
+        return record
 
     def get(self, run_id: str) -> RunRecord | None:
         return self._records.get(run_id)
@@ -215,36 +230,38 @@ class RunAPI:
             raise ValidationError("input", str(exc)) from exc
 
         key = idempotency_key or f"key_{secrets.token_hex(12)}"
-        created_at = datetime.now(UTC)
-        started_at = datetime.now(UTC)
-        try:
-            outcome = self._executor.execute(text)
-        except Exception:
-            logger.debug("Run executor raised an exception", exc_info=True)
-            outcome = ExecutionOutcome(
-                ok=False,
-                result=None,
-                error="执行器异常",
+        with self._store.submission(idempotency_key=key) as save:
+            created_at = datetime.now(UTC)
+            started_at = datetime.now(UTC)
+            try:
+                outcome = self._executor.execute(text)
+            except Exception:
+                logger.debug("Run executor raised an exception", exc_info=True)
+                outcome = ExecutionOutcome(
+                    ok=False,
+                    result=None,
+                    error="执行器异常",
+                )
+
+            record = RunRecord(
+                run_id=self._new_run_id(),
+                request=text,
+                status=RunStatus.SUCCEEDED if outcome.ok else RunStatus.FAILED,
+                result=outcome.result if outcome.ok else None,
+                error=outcome.error if not outcome.ok else None,
+                run_type=run_type,
+                input=input_data,
+                created_at=created_at,
+                started_at=started_at,
+                ended_at=datetime.now(UTC),
             )
 
-        record = RunRecord(
-            run_id=self._new_run_id(),
-            request=text,
-            status=RunStatus.SUCCEEDED if outcome.ok else RunStatus.FAILED,
-            result=outcome.result if outcome.ok else None,
-            error=outcome.error if not outcome.ok else None,
-            run_type=run_type,
-            input=input_data,
-            created_at=created_at,
-            started_at=started_at,
-            ended_at=datetime.now(UTC),
-        )
-
-        for _ in range(MAX_ID_ATTEMPTS):
-            if self._store.add(record, idempotency_key=key):
-                return record
-            record = replace(record, run_id=self._new_run_id())
-        raise RunStoreError("无法分配唯一的运行 ID，未保存运行记录")
+            for _ in range(MAX_ID_ATTEMPTS):
+                saved_record = save(record)
+                if saved_record is not None:
+                    return saved_record
+                record = replace(record, run_id=self._new_run_id())
+            raise RunStoreError("无法分配唯一的运行 ID，未保存运行记录")
 
     def get_run(self, run_id: str) -> RunRecord | None:
         return self._store.get(run_id)

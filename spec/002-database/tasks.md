@@ -36,7 +36,7 @@ python -m codeagent_v2
 | AC-03 | 输入 `/run [fail] 数据库验收`，退出并重启 CLI，输入 `/get <失败运行的 run_id>` | 提交返回 ID，查询显示「执行失败」和「固定执行器按要求返回失败」 |
 | AC-04 | 输入 `/run`、超过 2000 字符的请求和 `/get run_missing` | 两次提交均被拒绝，记录数不变。未知 ID 显示「找不到这次运行」 |
 | AC-05 | 退出 CLI，在同一个库再次执行 `python -m alembic upgrade head`，重启后查询两个 ID | 迁移成功，两条记录的 ID 和内容一致 |
-| AC-06 | 分别让迁移和启动连接不可用的库，用未迁移的库启动 CLI，再模拟 CLI 运行中读写失败 | 迁移或启动返回非零退出码。运行中的命令显示对应错误，随后 `/help` 和 `/exit` 可用 |
+| AC-06 | 验证连接或迁移失败，再模拟 CLI 运行中的读写错误和锁等待超时 | 迁移或启动返回非零退出码。运行中显示简要错误，保留 `/help` 和 `/exit` 的交互能力 |
 | AC-07 | 通过真实 CLI 运行 `/run`，从数据库读取同一 ID，再启动另一 CLI 运行 `/get <run_id>` | 数据库行和两个 CLI 进程展示的执行结果一致 |
 | AC-08 | 检查 `database.py`、`repository.py`、RunAPI 和 CLI 的调用关系 | 引擎与会话由 `database.py` 管理，数据库读写经 `repository.py` 执行 |
 | AC-09 | 用并发连接给同一个 run 追加事件，再输入 `/events <run_id>` | `run.created` 的 `sequence` 为 1，追加事件的 `sequence` 唯一且递增，终端按 `sequence` 升序显示 |
@@ -44,7 +44,7 @@ python -m codeagent_v2
 | AC-11 | 用不同组织上下文执行 `/get <run_id>`、`/events <run_id>` 和 `/trace <run_id>` | 三条命令均提示「找不到这次运行」，查询条件均包含 `org_id` |
 | AC-12 | 正常提交一次，再注入事件插入错误提交一次 | 独立连接可查到正常运行及其 `run.created`。注入错误的运行和事件均未落库 |
 | AC-13 | 不设置身份变量启动 CLI 提交一次，再设置 `CODEAGENT_ORG_ID=org-manual`、`CODEAGENT_USER_ID=user-manual` 提交一次 | 默认行保存为 `local-org` / `local-user`；覆盖行保存为指定身份 |
-| AC-14 | 用同一 `idempotency_key` 提交两次，再让固定 ID 先冲突一次 | 第二次返回幂等键冲突，原运行和事件数量不变；主键冲突后生成新 ID，执行器只调用一次 |
+| AC-14 | 用同一 `idempotency_key` 并发提交两次，再单独制造运行主键冲突 | 并发提交只调用一次固定执行器，保留一条运行和一条创建事件。主键冲突换新 ID 后保存已有执行结果 |
 | AC-15 | 提交嵌套键和值含实际 U+0000 的输入，再提交包含普通文本 `\u0000` 的输入 | 前者被拒绝且运行数不变；后者保存并原样读回 |
 
 ## 交付清单
@@ -56,6 +56,8 @@ python -m codeagent_v2
 5. 说明 SQLite 和 PostgreSQL 在 JSONB、时间字段、并发写入及本章验收环境上的差异。
 
 ## 本次验证记录
+
+审查修复复验使用 Python 3.12.14 和独立 PostgreSQL 16.15。`python -m pytest -p no:cacheprovider tests -q --tb=short` 完整运行，74 项通过。五项回归覆盖数据库错误输出、并发幂等、JSONB 数值往返、锁超时后继续交互和普通 PostgreSQL 连接串。另用普通连接串生成 Alembic 离线 SQL，核对八张应用表均出现在输出中。
 
 验证日期：2026-11-20。环境：Windows + PowerShell、Python 3.12.14、PostgreSQL 16.16、SQLAlchemy 2.0.58、psycopg 3.3.9、Alembic 1.20.1、pytest 8.4.2。连接串使用占位符形式 `postgresql+psycopg://<用户>@<主机>:<端口>/<数据库>`，验收使用本机独立 PostgreSQL 16 测试实例；未记录真实凭证。
 

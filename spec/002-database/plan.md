@@ -218,7 +218,7 @@ CREATE INDEX idx_audit_logs_org_created
 
 ```text
 启动 → 读取数据库配置 → 检查连接及 Alembic 版本 → 创建 RunAPI → 进入 CLI
-/run → RunAPI → 校验 → 固定执行器 → repository 同事务写入 run 与 run.created → 显示结果
+/run → RunAPI → 校验 → repository 检查并锁定幂等键 → 固定执行器 → 同事务写入 run 与 run.created → 显示结果
 /get → RunAPI → repository 按 org_id 和 id 查运行 → 显示结果
 /events → RunAPI → repository 按组织查运行及事件 → 按 sequence 升序显示
 /trace → RunAPI → repository 按组织查运行及关联表 → 显示执行轨迹
@@ -228,16 +228,17 @@ SQLAlchemy 查询和写入集中在 `repository.py`。CLI 通过 RunAPI 调用�
 
 `agent_runs.id` 对应 `RunResponse.run_id`，三个 JSONB 列对应 `input`、`output` 和 `error`。读回的时间戳统一为 UTC。当前组织和用户随存储层装配传入，`CreateRunRequest.idempotency_key` 随运行记录写入。
 
-`RunStore` 提供 `add(record: RunRecord, *, idempotency_key: str) -> bool`、`get(run_id: str) -> RunRecord | None`、`list_events(run_id: str) -> list[RunEvent] | None`、`append_event(...)` 和 `get_trace(run_id: str) -> RunTrace | None`。`add` 先插入运行记录，再用同一会话和事务插入 `sequence = 1` 的 `run.created`。仅在两条记录提交后返回 `True`。事件插入失败时回滚事务。`INSERT … ON CONFLICT (id) DO NOTHING RETURNING id` 未返回行时，直接返回 `False`，跳过事件写入。RunAPI 此时只生成新 ID 并重试写入，固定执行器只运行一次。`(org_id, idempotency_key)` 冲突单独处理：存储层抛出 `DuplicateIdempotencyKeyError`，RunAPI 将其作为明确冲突返回，已有运行和事件保留。 [SQLAlchemy PostgreSQL 插入冲突处理](https://docs.sqlalchemy.org/en/20/dialects/postgresql.html#insert-on-conflict-upsert)
+`RunStore.submission(idempotency_key=...)` 打开提交事务。在 `READ COMMITTED` 下按组织和幂等键获取 PostgreSQL 事务级 advisory lock，再查询是否已有运行。发现冲突时抛出 `DuplicateIdempotencyKeyError`。拿到执行权的提交调用固定执行器，并在同一事务中保存运行和 `sequence = 1` 的 `run.created`。事件插入失败时回滚事务。锁在事务结束时释放。 [PostgreSQL advisory lock](https://www.postgresql.org/docs/16/explicit-locking.html#ADVISORY-LOCKS)
+
+保存运行使用 `INSERT … ON CONFLICT (id) DO NOTHING RETURNING`。主键冲突时 RunAPI 更换 ID，复用本次执行结果。插入成功时用数据库返回的记录生成创建响应，与查询共享行转换，确保 `JSONB` 规范化后的值一致。 [SQLAlchemy PostgreSQL 插入冲突处理](https://docs.sqlalchemy.org/en/20/dialects/postgresql.html#insert-on-conflict-upsert)
 
 追加事件时，在同一事务中用 `SELECT … FOR UPDATE` 锁定当前组织的运行记录，读取该运行当前最大 `sequence` 后加 1，再插入事件。`UNIQUE (run_id, sequence)` 保证同一运行的序号唯一。所有读取入口先以 `org_id` 和 `id` 定位运行，再读取其关联记录。 [PostgreSQL 行级锁](https://www.postgresql.org/docs/16/explicit-locking.html#LOCKING-ROWS)
 
-存储层将数据库读写异常转换为 `RunStoreError`，由 CLI 根据命令显示「保存未确认」或「查询失败」。`get`、`list_events` 和 `get_trace` 仅在查询成功且无行时返回 `None`。数据库连接和事务按操作管理，写入提交异常交由 CLI 报告。`run_repl` 保留注入 RunAPI 的入口，内存测试可通过该入口继续验证终端交互。
+存储层将数据库读写异常转换为 `RunStoreError`，由 CLI 根据命令显示「保存未确认」或「查询失败」。公开提示使用操作名称和超时类别。运行时连接的单条 SQL 超时为 15 秒，锁等待超时为 3 秒。Alembic 使用独立连接设置执行迁移。`get`、`list_events` 和 `get_trace` 仅在查询成功且无行时返回 `None`。`run_repl` 保留注入 RunAPI 的入口，内存测试可通过该入口继续验证终端交互。 [PostgreSQL 超时参数](https://www.postgresql.org/docs/16/runtime-config-client.html)
 
 ### 已确认约定
 
 - 本地 CLI 从 `CODEAGENT_ORG_ID` 和 `CODEAGENT_USER_ID` 读取身份，缺省值分别是 `local-org` 和 `local-user`。当前组织和用户随 `PostgresRunStore` 装配传入，所有查询条件都包含 `org_id`。
-- 同一组织重复提交 `idempotency_key` 时返回明确冲突错误，不返回已有运行，也不覆盖已有运行或事件。只有 `agent_runs.id` 主键冲突才由 RunAPI 重新生成 `run_id` 并重试 `add`；执行器结果和事件内容保持不变，执行器只调用一次。
 - 保留 PostgreSQL `JSONB`。RunAPI 在执行前遍历 `input` 的嵌套对象和数组，检查实际的 U+0000 字符，包括 JSON 键和值；实际空字符按非法输入拒绝。文本中的反斜杠加 `u0000` 不是 U+0000，可正常保存和读回。 [PostgreSQL 16 JSON 类型](https://www.postgresql.org/docs/16/datatype-json.html)
 - 集成测试使用 `CODEAGENT_TEST_DATABASE_URL`，并在测试库内创建独立 schema；可选的 `CODEAGENT_DATABASE_SCHEMA` 让 CLI、Alembic 和存储层在同一 search path 下工作。生产验收仍使用测试库的默认 schema。
 

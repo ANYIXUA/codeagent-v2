@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 
 from pydantic import ValidationError as SchemaValidationError
@@ -500,8 +501,11 @@ class CLIEventsAndTraceTests(unittest.TestCase):
 
     def test_cli_reports_store_failures_and_keeps_running(self) -> None:
         class FailingStore(InMemoryRunStore):
-            def add(self, record: RunRecord, *, idempotency_key: str) -> bool:
-                raise RunStoreError("数据库连接中断")
+            def submission(self, *, idempotency_key: str):
+                def fail_save(record: RunRecord) -> RunRecord | None:
+                    raise RunStoreError("数据库连接中断")
+
+                return nullcontext(fail_save)
 
             def get(self, run_id: str) -> RunRecord | None:
                 raise RunStoreError("数据库连接中断")

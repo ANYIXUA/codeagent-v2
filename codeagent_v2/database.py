@@ -9,8 +9,8 @@ from pathlib import Path
 from alembic.config import Config
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from sqlalchemy import Engine, create_engine, make_url, text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import Engine, URL, create_engine, make_url, text
+from sqlalchemy.exc import ArgumentError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -37,22 +37,29 @@ class DatabaseNotReady(DatabaseError):
     pass
 
 
-def get_database_url() -> str:
+def _parse_database_url(url: str) -> URL:
+    try:
+        parsed = make_url(url)
+    except (ArgumentError, ValueError):
+        raise DatabaseConfigError(f"{DATABASE_URL_ENV} 格式无效。") from None
+    if parsed.drivername == "postgresql":
+        return parsed.set(drivername="postgresql+psycopg")
+    if parsed.drivername != "postgresql+psycopg":
+        raise DatabaseConfigError(
+            f"{DATABASE_URL_ENV} 必须使用 PostgreSQL 连接串"
+            "（postgresql:// 或 postgresql+psycopg://）。"
+        )
+    return parsed
+
+
+def get_database_url() -> URL:
     url = os.environ.get(DATABASE_URL_ENV, "").strip()
     if not url:
         raise DatabaseConfigError(
             f"未配置 {DATABASE_URL_ENV}。示例："
             "postgresql+psycopg://<用户>:<密码>@<主机>:<端口>/<数据库>"
         )
-    try:
-        parsed = make_url(url)
-    except Exception as exc:  # SQLAlchemy raises ArgumentError for malformed URLs.
-        raise DatabaseConfigError(f"{DATABASE_URL_ENV} 格式无效：{exc}") from exc
-    if not parsed.drivername.startswith("postgresql"):
-        raise DatabaseConfigError(
-            f"{DATABASE_URL_ENV} 必须使用 PostgreSQL 连接串（postgresql+psycopg://...）"
-        )
-    return url
+    return _parse_database_url(url)
 
 
 def get_database_schema() -> str | None:
@@ -76,20 +83,30 @@ def create_database_engine(
     url: str | None = None,
     *,
     schema: str | None = None,
+    runtime_timeouts: bool = True,
 ) -> Engine:
-    database_url = url or get_database_url()
+    database_url = _parse_database_url(url) if url else get_database_url()
     connect_args: dict[str, object] = {"connect_timeout": 10}
+    options = list(database_url.normalized_query.get("options", ()))
     target_schema = schema if schema is not None else get_database_schema()
     if target_schema is not None:
-        connect_args["options"] = f"-c search_path={target_schema}"
+        options.append(f"-c search_path={target_schema}")
+    if runtime_timeouts:
+        options.extend(["-c statement_timeout=15s", "-c lock_timeout=3s"])
+    if options:
+        connect_args["options"] = " ".join(options)
     try:
         return create_engine(
             database_url,
             pool_pre_ping=True,
+            hide_parameters=True,
+            isolation_level="READ COMMITTED",
             connect_args=connect_args,
         )
-    except (SQLAlchemyError, TypeError, ValueError) as exc:
-        raise DatabaseConfigError(f"无法创建数据库引擎：{exc}") from exc
+    except (SQLAlchemyError, ImportError, TypeError, ValueError):
+        raise DatabaseConfigError(
+            "无法创建数据库引擎，请检查连接配置和 psycopg 依赖。"
+        ) from None
 
 
 def create_session_factory(engine: Engine) -> sessionmaker[Session]:
@@ -116,8 +133,10 @@ def ensure_database_ready(engine: Engine) -> None:
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
             current = MigrationContext.configure(connection).get_current_revision()
-    except SQLAlchemyError as exc:
-        raise DatabaseUnavailable(f"无法连接数据库：{exc}") from exc
+    except SQLAlchemyError:
+        raise DatabaseUnavailable(
+            "无法连接或检查数据库，请核对数据库配置和服务状态。"
+        ) from None
 
     head = get_alembic_head()
     if current != head:

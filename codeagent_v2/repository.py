@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import json
 import secrets
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Any, Callable
+from functools import partial
+from hashlib import blake2b
+from typing import Any
 
 import sqlalchemy as sa
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -42,9 +48,13 @@ def _to_utc(value: Any) -> Any:
     return value
 
 
-def _error_reason(exc: SQLAlchemyError) -> str:
-    original = getattr(exc, "orig", None)
-    return str(original if original is not None else exc).strip()
+def _store_error(message: str, exc: SQLAlchemyError) -> RunStoreError:
+    sqlstate = getattr(getattr(exc, "orig", None), "sqlstate", None)
+    if sqlstate == "55P03":
+        message += "：数据库锁等待超时"
+    elif sqlstate == "57014":
+        message += "：数据库操作已取消或超时"
+    return RunStoreError(message)
 
 
 class PostgresRunStore:
@@ -64,64 +74,74 @@ class PostgresRunStore:
         self._id_factory = id_factory or _default_id
 
     def add(self, record: RunRecord, *, idempotency_key: str) -> bool:
-        session = self._session_factory()
+        with self.submission(idempotency_key=idempotency_key) as save:
+            return save(record) is not None
+
+    @contextmanager
+    def submission(
+        self, *, idempotency_key: str
+    ) -> Iterator[Callable[[RunRecord], RunRecord | None]]:
         try:
-            with session.begin():
+            with self._session_factory.begin() as session:
+                # All processes must derive the same lock for the same organization and key.
+                key_bytes = json.dumps([self.org_id, idempotency_key]).encode("ascii")
+                digest = blake2b(key_bytes, digest_size=8, person=b"codeagent-run").digest()
+                lock_id = int.from_bytes(digest, "big", signed=True)
+                session.execute(sa.select(sa.func.pg_advisory_xact_lock(lock_id)))
+
                 existing_id = session.scalar(
                     sa.select(agent_runs.c.id)
                     .where(agent_runs.c.org_id == self.org_id)
                     .where(agent_runs.c.idempotency_key == idempotency_key)
                 )
                 if existing_id is not None:
-                    raise DuplicateIdempotencyKeyError(
-                        "同一组织已使用该 idempotency_key，已保留原有运行记录"
-                    )
-                statement = (
-                    pg_insert(agent_runs)
-                    .values(
-                        id=record.run_id,
-                        org_id=self.org_id,
-                        user_id=self.user_id,
-                        run_type=record.run_type,
-                        status=record.status.value,
-                        idempotency_key=idempotency_key,
-                        input_json=record.input,
-                        output_json=(
-                            {"text": record.result} if record.result is not None else None
-                        ),
-                        error_json=(
-                            {"code": "RUN_FAILED", "message": record.error}
-                            if record.error is not None
-                            else None
-                        ),
-                        created_at=record.created_at,
-                        started_at=record.started_at,
-                        ended_at=record.ended_at,
-                        updated_at=record.ended_at or datetime.now(UTC),
-                    )
-                    .on_conflict_do_nothing(index_elements=[agent_runs.c.id])
-                    .returning(agent_runs.c.id)
-                )
-                inserted = session.execute(statement).scalar_one_or_none()
-                if inserted is None:
-                    return False
-                self._insert_created_event(session, record)
-            return True
+                    raise DuplicateIdempotencyKeyError()
+                yield partial(self._save_run, session, idempotency_key=idempotency_key)
         except IntegrityError as exc:
             constraint_name = getattr(
                 getattr(exc.orig, "diag", None),
                 "constraint_name",
                 None,
             )
-            if constraint_name == IDEMPOTENCY_CONSTRAINT or IDEMPOTENCY_CONSTRAINT in str(exc):
-                raise DuplicateIdempotencyKeyError(
-                    "同一组织已使用该 idempotency_key，已保留原有运行记录"
-                ) from exc
-            raise RunStoreError(f"保存运行记录失败：{_error_reason(exc)}") from exc
+            if constraint_name == IDEMPOTENCY_CONSTRAINT:
+                raise DuplicateIdempotencyKeyError() from None
+            raise _store_error("保存运行记录失败", exc) from None
         except SQLAlchemyError as exc:
-            raise RunStoreError(f"保存运行记录失败：{_error_reason(exc)}") from exc
-        finally:
-            session.close()
+            raise _store_error("保存运行记录失败", exc) from None
+
+    def _save_run(
+        self, session: Session, record: RunRecord, *, idempotency_key: str
+    ) -> RunRecord | None:
+        statement = (
+            pg_insert(agent_runs)
+            .values(
+                id=record.run_id,
+                org_id=self.org_id,
+                user_id=self.user_id,
+                run_type=record.run_type,
+                status=record.status.value,
+                idempotency_key=idempotency_key,
+                input_json=record.input,
+                output_json={"text": record.result} if record.result is not None else None,
+                error_json=(
+                    {"code": "RUN_FAILED", "message": record.error}
+                    if record.error is not None
+                    else None
+                ),
+                created_at=record.created_at,
+                started_at=record.started_at,
+                ended_at=record.ended_at,
+                updated_at=record.ended_at or datetime.now(UTC),
+            )
+            .on_conflict_do_nothing(index_elements=[agent_runs.c.id])
+            .returning(agent_runs)
+        )
+        row = session.execute(statement).mappings().one_or_none()
+        if row is None:
+            return None
+        saved = self._record_from_row(row)
+        self._insert_created_event(session, saved)
+        return replace(saved, request=record.request)
 
     def _insert_created_event(self, session: Session, record: RunRecord) -> None:
         session.execute(
@@ -154,7 +174,7 @@ class PostgresRunStore:
             )
             return self._record_from_row(row) if row is not None else None
         except SQLAlchemyError as exc:
-            raise RunStoreError(f"查询运行记录失败：{_error_reason(exc)}") from exc
+            raise _store_error("查询运行记录失败", exc) from None
         finally:
             session.close()
 
@@ -174,7 +194,7 @@ class PostgresRunStore:
             )
             return [self._event_from_row(row) for row in rows]
         except SQLAlchemyError as exc:
-            raise RunStoreError(f"查询运行事件失败：{_error_reason(exc)}") from exc
+            raise _store_error("查询运行事件失败", exc) from None
         finally:
             session.close()
 
@@ -224,7 +244,7 @@ class PostgresRunStore:
                 )
             return event
         except SQLAlchemyError as exc:
-            raise RunStoreError(f"保存运行事件失败：{_error_reason(exc)}") from exc
+            raise _store_error("保存运行事件失败", exc) from None
         finally:
             session.close()
 
@@ -286,7 +306,7 @@ class PostgresRunStore:
                 checkpoints=saved_checkpoints,
             )
         except SQLAlchemyError as exc:
-            raise RunStoreError(f"查询执行轨迹失败：{_error_reason(exc)}") from exc
+            raise _store_error("查询执行轨迹失败", exc) from None
         finally:
             session.close()
 

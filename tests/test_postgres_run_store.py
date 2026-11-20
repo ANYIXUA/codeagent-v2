@@ -4,6 +4,7 @@ import io
 import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
+from threading import Barrier
 
 import pytest
 from sqlalchemy import func, insert, select, text
@@ -84,6 +85,20 @@ def test_success_round_trip_matches_response(pg_store) -> None:
     assert event["payload_json"]["run_id"] == response.run_id
 
 
+def test_postgres_normalized_numbers_match_in_create_and_query(pg_store) -> None:
+    api = make_api(pg_store.store)
+    response = api.create_run(
+        CreateRunRequest(
+            run_type="text",
+            idempotency_key="pg-large-number-key",
+            input={"query": "数值往返", "metadata": {"number": 1e30}},
+        )
+    )
+
+    assert api.query_run(response.run_id) == response
+    assert response.input == {"query": "数值往返", "metadata": {"number": 10**30}}
+
+
 def test_failure_round_trip_matches_response(pg_store) -> None:
     api = make_api(pg_store.store, ids=["run_pg_failure_01"])
     response = api.create_run(create_request("[fail] 数据库验收", "pg-failure-key-01"))
@@ -138,6 +153,33 @@ def test_duplicate_idempotency_key_preserves_existing_run_and_events(pg_store) -
         (1, "run.created")
     ]
     assert events[0].payload["input"] == {"query": "第一次提交"}
+
+
+def test_concurrent_duplicate_idempotency_key_executes_once(pg_store) -> None:
+    ready = Barrier(2)
+    executed_requests = []
+
+    class CountingExecutor:
+        def execute(self, request: str) -> ExecutionOutcome:
+            executed_requests.append(request)
+            return FixedExecutor().execute(request)
+
+    def submit_duplicate(query: str) -> str | None:
+        store = make_store(pg_store.session_factory)
+        api = RunAPI(store, CountingExecutor())
+        ready.wait(timeout=5)
+        try:
+            return api.create_run(create_request(query, "pg-concurrent-duplicate")).run_id
+        except DuplicateIdempotencyKeyError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        run_ids = list(workers.map(submit_duplicate, ["并发请求甲", "并发请求乙"]))
+
+    assert run_ids.count(None) == 1
+    assert len(executed_requests) == 1
+    assert count_rows(pg_store.engine, agent_runs) == 1
+    assert count_rows(pg_store.engine, run_events) == 1
 
 
 def test_primary_key_conflict_retries_and_executes_once(pg_store) -> None:
@@ -605,7 +647,8 @@ def test_cli_write_failure_reports_unconfirmed_and_continues(pg_store) -> None:
                 CREATE FUNCTION fail_cli_events() RETURNS trigger
                 LANGUAGE plpgsql AS $$
                 BEGIN
-                    RAISE EXCEPTION 'forced cli event failure';
+                    RAISE EXCEPTION 'forced cli event failure'
+                    USING DETAIL = NEW.payload_json -> 'input' ->> 'query';
                 END;
                 $$;
                 """
@@ -634,10 +677,44 @@ def test_cli_write_failure_reports_unconfirmed_and_continues(pg_store) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "保存未确认：" in result.stdout
+    assert "forced cli event failure" not in result.stdout + result.stderr
+    assert "写入故障" not in result.stdout + result.stderr
     assert "/events <run_id>" in result.stdout
     assert "再见。" in result.stdout
     assert count_rows(pg_store.engine, agent_runs) == 0
     assert count_rows(pg_store.engine, run_events) == 0
+
+
+def test_cli_lock_timeout_returns_to_prompt(pg_store) -> None:
+    api = make_api(pg_store.store)
+    response = api.create_run(create_request("锁等待", "pg-cli-lock-timeout"))
+    with pg_store.engine.begin() as connection:
+        assert connection.scalar(text("SHOW statement_timeout")) != "0"
+        assert connection.scalar(text("SHOW lock_timeout")) != "0"
+        connection.execute(text("LOCK TABLE run_events IN ACCESS EXCLUSIVE MODE"))
+        result = run_cli(
+            pg_store.schema,
+            [f"/events {response.run_id}", "/help", "/exit"],
+            org_id=pg_store.store.org_id,
+        )
+
+    assert result.returncode == 0, result.stderr
+    assert "查询失败：" in result.stdout
+    assert "超时" in result.stdout
+    assert "/events <run_id>" in result.stdout
+    assert "再见。" in result.stdout
+
+
+def test_cli_accepts_postgresql_url_without_explicit_driver(pg_store, monkeypatch) -> None:
+    monkeypatch.setenv(
+        "CODEAGENT_TEST_DATABASE_URL",
+        pg_store.url.replace("postgresql+psycopg://", "postgresql://", 1),
+    )
+
+    result = run_cli(pg_store.schema, ["/run 连接串验收", "/exit"])
+
+    assert result.returncode == 0, result.stderr
+    assert "执行成功" in result.stdout
 
 
 def test_cli_read_failure_reports_query_failure_and_continues(

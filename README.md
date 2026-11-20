@@ -70,6 +70,8 @@ python -m codeagent_v2
 
 CLI 启动时先检查数据库连接和 Alembic 版本。连接失败或版本未就绪时，命令给出原因并以非零退出码结束。
 
+`CODEAGENT_DATABASE_URL` 也接受 `postgresql://`，应用和 Alembic 都用 psycopg 3 连接。CLI 的单条 SQL 超时为 15 秒，锁等待超时为 3 秒。数据库操作失败时，终端显示简要错误。Alembic 迁移使用独立的连接设置。
+
 身份来自环境变量：
 
 ```powershell
@@ -112,7 +114,7 @@ codeagent> /events run_9f3a1c7b2d4e
 
 - `/run` 把运行记录和序号 1 的 `run.created` 放在同一事务；事件插入失败时运行记录一起回滚，终端提示「保存未确认」。
 - 追加事件时先用 `SELECT ... FOR UPDATE` 锁定当前组织的运行，再取当前最大 `sequence` 加 1；`UNIQUE (run_id, sequence)` 兜底。
-- 同一组织重复使用 `idempotency_key` 时返回明确的冲突错误，不覆盖已有运行和事件。只有 `agent_runs.id` 主键冲突才重新生成 `run_id`，固定执行器只运行一次。
+- 同一组织的相同 `idempotency_key` 在调用固定执行器前加锁检查。运行提交成功后，后续同键提交返回冲突。事务回滚后允许重试同一个键。`agent_runs.id` 主键冲突时重新生成 `run_id`，复用已经完成的执行结果。
 - 数据库保留 JSONB。持久化入口在执行前检查嵌套 JSON 的键和值是否包含实际的 U+0000 字符；普通文本中的 `\u0000` 六个字符可以正常保存。
 
 ## 测试
